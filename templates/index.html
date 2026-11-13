@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Attendance</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #121212; color: #fff;
+            margin: 0; padding: 20px;
+            display: flex; justify-content: center;
+        }
+        .wrap { max-width: 900px; width: 100%; }
+        .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+        .top h2 { margin: 0; color: #00ff88; }
+        a.btn {
+            color: #000; background: #00e5ff; text-decoration: none;
+            font-weight: bold; padding: 10px 18px; border-radius: 8px;
+        }
+        .video-box { border: 2px solid #00ff88; border-radius: 8px; overflow: hidden; background: #000; }
+        .video-box img { width: 100%; display: block; }
+        .hint { font-size: 13px; color: #aaa; }
+
+        /* ---------- Popup (toast) ---------- */
+        #toastBox { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; }
+        .toast {
+            min-width: 280px; padding: 14px 18px; border-radius: 10px; color: #000; font-family: Arial, sans-serif;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5); animation: slideIn .3s ease;
+        }
+        .toast b { display: block; font-size: 16px; margin-bottom: 4px; }
+        .toast small { opacity: .8; }
+        .toast.captured { background: #00ff88; }
+        .toast.already  { background: #00e5ff; }
+        .toast.noclass  { background: #ffd54f; }
+        .toast.unknown, .toast.offline { background: #ff6b6b; }
+        @keyframes slideIn { from { transform: translateX(120%); opacity: 0; } to { transform: none; opacity: 1; } }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="top">
+        <h2>Face Attendance</h2>
+        <a class="btn" href="{{ url_for('register_page') }}">+ Register Student</a>
+    </div>
+
+    <div class="video-box">
+        <img src="{{ url_for('video_feed') }}" alt="Live attendance camera">
+    </div>
+    <p class="hint">Look at the camera. A green box with your name appears when you are recognised,
+        and a popup confirms when attendance is marked.</p>
+</div>
+
+<div id="toastBox"></div>
+
+<script>
+    let lastEventId = null;
+
+    function showToast(e) {
+        const titles = {
+            captured: '✅ Attendance Marked',
+            already:  'ℹ️ Already Marked Today',
+            noclass:  '⏳ No Class Running Now',
+            unknown:  '⚠️ Student Not Found',
+            offline:  '❌ Database Error'
+        };
+        const div = document.createElement('div');
+        div.className = 'toast ' + e.type;
+        div.innerHTML = '<b>' + (titles[e.type] || 'Notice') + '</b>' +
+                        e.roll_no + ' - ' + e.name + '<br><small>' +
+                        (e.message || '') + ' &bull; ' + e.time + '</small>';
+        document.getElementById('toastBox').appendChild(div);
+        setTimeout(() => div.remove(), 5000);
+    }
+
+    async function pollEvents() {
+        try {
+            const url = lastEventId === null ? '/api/events' : '/api/events?after=' + lastEventId;
+            const d = await (await fetch(url)).json();
+            lastEventId = d.last_id;
+            d.events.forEach(showToast);
+        } catch (e) {}
+    }
+    pollEvents();
+    setInterval(pollEvents, 1000);
+</script>
+</body>
+</html>

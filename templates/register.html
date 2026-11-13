@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register Student</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #121212; color: #fff;
+            margin: 0; padding: 20px;
+            display: flex; justify-content: center;
+        }
+        .wrap { max-width: 900px; width: 100%; }
+        .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+        .top h2 { margin: 0; color: #00ff88; }
+        a.back {
+            color: #000; background: #00e5ff; text-decoration: none;
+            font-weight: bold; padding: 10px 18px; border-radius: 8px;
+        }
+        .grid { display: flex; gap: 24px; flex-wrap: wrap; }
+        .card {
+            background: #1e1e1e; padding: 24px; border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            flex: 1; min-width: 300px;
+        }
+        input {
+            width: 100%; padding: 10px; margin: 8px 0 16px;
+            border-radius: 6px; border: 1px solid #444;
+            background: #2c2c2c; color: #fff;
+            box-sizing: border-box; font-size: 14px;
+        }
+        button {
+            background: #00ff88; color: #000; font-weight: bold;
+            border: none; padding: 12px; border-radius: 6px;
+            cursor: pointer; width: 100%; font-size: 15px;
+        }
+        button:hover { background: #00cc6e; }
+        button:disabled { opacity: 0.6; cursor: wait; }
+        .video-box { border: 2px solid #00ff88; border-radius: 8px; overflow: hidden; background: #000; }
+        .video-box img { width: 100%; display: block; }
+        .hint { font-size: 13px; color: #aaa; }
+        #status { margin-top: 14px; min-height: 20px; font-size: 14px; color: #00e5ff; }
+        #status.error { color: #ff6b6b; }
+        #status.ok { color: #00ff88; }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="top">
+        <h2>Register New Student</h2>
+        <a class="back" href="{{ url_for('index') }}">← Back to Attendance</a>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <div class="video-box">
+                <img src="{{ url_for('raw_feed') }}" alt="Camera preview">
+            </div>
+            <p class="hint">Face the camera, only one person in view, good lighting.</p>
+        </div>
+
+        <div class="card">
+            <form id="regForm" onsubmit="registerUser(event)">
+                <label for="roll_no">Registration Number (same as in the college portal)</label>
+                <input type="text" id="roll_no" placeholder="e.g. STU001" required onblur="fillName()">
+
+                <label for="name">Full Name (auto-filled from the college portal)</label>
+                <input type="text" id="name" placeholder="Auto-filled from the portal">
+
+                <button type="submit" id="submitBtn">Capture &amp; Register Face</button>
+            </form>
+            <div id="status"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+    async function fillName() {
+        const roll = document.getElementById('roll_no').value.trim();
+        const nameBox = document.getElementById('name');
+        if (!roll) return;
+        try {
+            const d = await (await fetch('/api/student/' + encodeURIComponent(roll))).json();
+            if (d.success) nameBox.value = d.name;
+        } catch (e) {}
+    }
+
+    async function registerUser(event) {
+        event.preventDefault();
+        const statusDiv = document.getElementById('status');
+        const btn = document.getElementById('submitBtn');
+        statusDiv.className = '';
+        statusDiv.innerText = 'Checking the college portal and capturing face...';
+        btn.disabled = true;
+
+        const formData = new URLSearchParams();
+        formData.append('roll_no', document.getElementById('roll_no').value);
+        formData.append('name', document.getElementById('name').value);
+
+        try {
+            const response = await fetch('/api/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: formData.toString()
+            });
+            const data = await response.json();
+            statusDiv.innerText = data.message;
+            statusDiv.className = data.success ? 'ok' : 'error';
+            if (data.success) {
+                document.getElementById('regForm').reset();
+            }
+        } catch (err) {
+            statusDiv.innerText = 'Error communicating with server.';
+            statusDiv.className = 'error';
+        }
+        btn.disabled = false;
+    }
+
+</script>
+</body>
+</html>
