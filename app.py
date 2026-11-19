@@ -21,6 +21,16 @@ PROCESS_EVERY_N = 2          # run recognition on every Nth frame
 RECHECK_SECONDS = 20         # how often the same face may be written to the database
 CONFIRM_FRAMES = 3           # face must be matched in this many consecutive checks before attendance is marked
 
+# ---------- Anti-spoofing settings ----------
+EAR_THRESHOLD = 0.21         # eye aspect ratio below this = eyes closed (blink)
+LIVE_VALID_SECONDS = 30      # after a blink the person stays "live" this long, then must blink again
+DEVICE_CONF = 0.25           # YOLO confidence for phone / tablet / laptop / screen
+DEVICE_OVERLAP = 0.6         # face is "on a device" if this fraction of the face lies inside a device box
+SPOOF_ALERT_SECONDS = 8      # don't repeat the spoof popup for the same person more often than this
+# COCO class ids: 62 = tv/monitor, 63 = laptop, 67 = cell phone (tablets usually fall in one of these)
+# Add 73 ("book") if you also want to catch printed photos held in a book/folder.
+DEVICE_CLASSES = {62: "Screen/Monitor", 63: "Laptop/Tablet", 67: "Mobile/Tablet"}
+
 # ---------- SAME database as the college portal ----------
 # These must match DB_CONFIG / DB_NAME in the portal's app.py.
 DB_CONFIG = {
@@ -55,7 +65,6 @@ def init_face_tables():
     The portal must have been started at least once so that `students` and `subjects` exist."""
     conn = get_db()
     cur = conn.cursor()
-    # One row per student whose face is registered in the face attendance software
     cur.execute("""
         CREATE TABLE IF NOT EXISTS face_registrations (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -67,7 +76,6 @@ def init_face_tables():
             CONSTRAINT fk_face_student FOREIGN KEY (student_id)
                 REFERENCES students(id) ON DELETE CASCADE
         ) ENGINE=InnoDB""")
-    # One row every time the camera marks someone Present (audit trail)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS face_attendance_log (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -181,7 +189,7 @@ def push_event(kind, roll_no, name, message=""):
         event_counter += 1
         events.append({
             "id": event_counter,
-            "type": kind,   # captured | already | noclass | unknown | offline
+            "type": kind,   # captured | already | noclass | unknown | offline | spoof
             "roll_no": roll_no,
             "name": name,
             "message": message,
@@ -193,6 +201,8 @@ def push_event(kind, roll_no, name, message=""):
 last_sent = {}      # student_id -> last time this face was written to the database
 streaks = {}        # student_id -> consecutive recognised checks
 face_state = {}     # student_id -> "captured" / "already" / "noclass" ... (shown on the video box)
+liveness = {}       # student_id -> {"closed": bool, "live_until": timestamp}
+last_spoof_alert = {}   # student_id or "unknown" -> last time a spoof popup was sent
 
 
 def handle_detection(student_id, reg_no, name):
@@ -232,6 +242,101 @@ class Camera:
 
 
 camera = Camera(0)
+
+
+# ---------- Anti-spoofing #1: device / screen detection (YOLO) ----------
+yolo_model = None
+try:
+    from ultralytics import YOLO
+    yolo_model = YOLO("yolov8n.pt")      # small model, downloaded automatically the first time
+    print("[INFO] Device detection (phone/tablet/screen) is ON.")
+except Exception as err:
+    print(f"[WARN] Device detection is OFF ({err}). Run: pip install ultralytics")
+
+device_boxes = []            # (x1, y1, x2, y2, name, confidence) in full-frame pixels
+devices_lock = threading.Lock()
+
+
+def device_worker():
+    """Looks for phones / tablets / screens in the background so the video stays smooth."""
+    while True:
+        frame = camera.get_frame()
+        if frame is None:
+            time.sleep(0.1)
+            continue
+        try:
+            res = yolo_model.predict(frame, imgsz=416, conf=DEVICE_CONF,
+                                     classes=list(DEVICE_CLASSES), verbose=False)[0]
+            found = []
+            for b in res.boxes:
+                x1, y1, x2, y2 = b.xyxy[0].tolist()
+                found.append((x1, y1, x2, y2, DEVICE_CLASSES[int(b.cls[0])], float(b.conf[0])))
+            with devices_lock:
+                device_boxes[:] = found
+        except Exception:
+            traceback.print_exc()
+        time.sleep(0.05)
+
+
+if yolo_model is not None:
+    threading.Thread(target=device_worker, daemon=True).start()
+
+
+def current_devices():
+    with devices_lock:
+        return list(device_boxes)
+
+
+def face_on_device(box, devices):
+    """box = (top, right, bottom, left). Returns the device name if the face lies inside a device."""
+    top, right, bottom, left = box
+    face_area = max(1, (right - left) * (bottom - top))
+    for (x1, y1, x2, y2, name, _conf) in devices:
+        iw = min(right, x2) - max(left, x1)
+        ih = min(bottom, y2) - max(top, y1)
+        if iw > 0 and ih > 0 and (iw * ih) / face_area >= DEVICE_OVERLAP:
+            return name
+    return None
+
+
+# ---------- Anti-spoofing #2: blink (liveness) detection ----------
+def eye_aspect_ratio(eye):
+    p = np.array(eye, dtype=np.float64)
+    a = np.linalg.norm(p[1] - p[5])
+    b = np.linalg.norm(p[2] - p[4])
+    c = np.linalg.norm(p[0] - p[3])
+    return (a + b) / (2.0 * c) if c else 1.0
+
+
+def update_liveness(sid, rgb_full, box, now):
+    """True once the person has blinked (eyes closed, then opened) within LIVE_VALID_SECONDS."""
+    st = liveness.setdefault(sid, {"closed": False, "live_until": 0})
+    if now < st["live_until"]:
+        return True
+    lm = face_recognition.face_landmarks(rgb_full, [box])
+    if not lm:
+        return False
+    ear = (eye_aspect_ratio(lm[0]["left_eye"]) + eye_aspect_ratio(lm[0]["right_eye"])) / 2.0
+    if ear < EAR_THRESHOLD:
+        st["closed"] = True
+    elif st["closed"]:                       # eyes were closed and are open again = a blink
+        st["closed"] = False
+        st["live_until"] = now + LIVE_VALID_SECONDS
+        return True
+    return False
+
+
+def alert_spoof(sid, meta, device_name):
+    key = sid if sid is not None else "unknown"
+    now = time.time()
+    if now - last_spoof_alert.get(key, 0) < SPOOF_ALERT_SECONDS:
+        return
+    last_spoof_alert[key] = now
+    roll = meta["roll_no"] if meta else "-"
+    name = meta["name"] if meta else "Unknown face"
+    push_event("spoof", roll, name,
+               f"Face shown on a {device_name}. Attendance blocked.")
+    print(f"[SECURITY] Spoof attempt: {roll} {name} on {device_name}")
 
 
 # ---------- Registered faces (stored in the face_registrations table) ----------
@@ -424,6 +529,13 @@ def register_face():
     if len(locations) > 1:
         return jsonify({"success": False, "message": "Multiple faces detected. Only one person please."})
 
+    # Do not allow registering a face that is displayed on a phone / tablet / screen
+    dev = face_on_device(locations[0], current_devices())
+    if dev:
+        return jsonify({"success": False,
+                        "message": f"Fake face detected: the face is shown on a {dev}. "
+                                   f"Register using the real person only."})
+
     encoding = face_recognition.face_encodings(rgb, locations)[0]
 
     reg_no = stu['registration_no']
@@ -447,6 +559,7 @@ def register_face():
 def generate_attendance_stream():
     frame_count = 0
     last_results = []
+    last_devs = []
 
     while True:
         frame = camera.get_frame()
@@ -458,6 +571,7 @@ def generate_attendance_stream():
             try:
                 small = cv2.resize(frame, (0, 0), fx=SCALE, fy=SCALE)
                 rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                rgb_full = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   # used for blink landmarks
                 locations = face_recognition.face_locations(rgb_small)
                 encodings = face_recognition.face_encodings(rgb_small, locations)
 
@@ -465,11 +579,18 @@ def generate_attendance_stream():
                     enc_list = list(known_encodings)
                     meta_list = list(known_metadata)
 
+                devices = current_devices()
+                last_devs = devices
+                now = time.time()
                 results = []
                 seen = set()
-                for enc, (top, right, bottom, left) in zip(encodings, locations):
+
+                for enc, loc in zip(encodings, locations):
+                    # (top, right, bottom, left) in full-frame pixels
+                    box = tuple(int(v / SCALE) for v in loc)
                     label, color = "Unknown", (0, 0, 255)
 
+                    sid, s = None, None
                     if enc_list:
                         distances = face_recognition.face_distance(enc_list, enc)
                         best = int(np.argmin(distances))
@@ -477,37 +598,61 @@ def generate_attendance_stream():
                             s = meta_list[best]
                             sid = s["student_id"]
                             seen.add(sid)
-                            streaks[sid] = streaks.get(sid, 0) + 1
 
-                            label = f"{s['roll_no']} - {s['name']}"
-                            color = (0, 255, 0)
+                    device_name = face_on_device(box, devices)
 
-                            # only act once the face is confirmed over several checks
-                            if streaks[sid] >= CONFIRM_FRAMES:
+                    if device_name:
+                        # FACE IS ON A PHONE / TABLET / SCREEN -> block and warn
+                        if sid is not None:
+                            streaks.pop(sid, None)
+                            liveness.pop(sid, None)
+                            face_state.pop(sid, None)
+                        label = f"FAKE! Face on {device_name}"
+                        color = (0, 140, 255)
+                        alert_spoof(sid, s, device_name)
+
+                    elif sid is not None:
+                        streaks[sid] = streaks.get(sid, 0) + 1
+                        label = f"{s['roll_no']} - {s['name']}"
+                        color = (0, 255, 0)
+
+                        if streaks[sid] >= CONFIRM_FRAMES:
+                            live = update_liveness(sid, rgb_full, box, now)
+                            if not live:
+                                label += "  (blink to verify)"
+                                color = (0, 255, 255)
+                            else:
                                 if face_state.get(sid) in ("captured", "already"):
                                     label += "  [PRESENT]"
-                                now = time.time()
                                 if now - last_sent.get(sid, 0) > RECHECK_SECONDS:
                                     last_sent[sid] = now
                                     threading.Thread(target=handle_detection,
                                                      args=(sid, s["roll_no"], s["name"]),
                                                      daemon=True).start()
-                            else:
-                                label += "  (verifying...)"
+                        else:
+                            label += "  (verifying...)"
 
-                    box = tuple(int(v / SCALE) for v in (top, right, bottom, left))
                     results.append((box, label, color))
 
-                # reset streaks for anyone who left the frame
+                # reset state for anyone who left the frame
                 for sid in list(streaks):
                     if sid not in seen:
                         del streaks[sid]
+                for sid in list(liveness):
+                    if sid not in seen:
+                        del liveness[sid]
                 last_results = results
             except Exception:
                 traceback.print_exc()   # shows the real error in the terminal
                 last_results = []
 
         frame_count += 1
+
+        # detected devices (orange boxes)
+        for (x1, y1, x2, y2, name, conf) in last_devs:
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 140, 255), 2)
+            cv2.putText(frame, f"{name} {conf:.0%}", (int(x1), max(int(y1) - 8, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
 
         for (top, right, bottom, left), label, color in last_results:
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)

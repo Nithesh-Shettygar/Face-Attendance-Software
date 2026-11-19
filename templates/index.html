@@ -20,7 +20,14 @@
         }
         .video-box { border: 2px solid #00ff88; border-radius: 8px; overflow: hidden; background: #000; }
         .video-box img { width: 100%; display: block; }
+        .video-box.alert { border-color: #ff3b3b; animation: flash .5s 4; }
         .hint { font-size: 13px; color: #aaa; }
+
+        /* ---------- Spoof banner ---------- */
+        #spoofBanner {
+            display: none; margin-bottom: 12px; padding: 14px 18px; border-radius: 8px;
+            background: #ff3b3b; color: #fff; font-weight: bold; font-size: 16px;
+        }
 
         /* ---------- Popup (toast) ---------- */
         #toastBox { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; }
@@ -34,7 +41,9 @@
         .toast.already  { background: #00e5ff; }
         .toast.noclass  { background: #ffd54f; }
         .toast.unknown, .toast.offline { background: #ff6b6b; }
+        .toast.spoof { background: #ff3b3b; color: #fff; border: 2px solid #fff; }
         @keyframes slideIn { from { transform: translateX(120%); opacity: 0; } to { transform: none; opacity: 1; } }
+        @keyframes flash { 50% { box-shadow: 0 0 24px #ff3b3b; } }
     </style>
 </head>
 <body>
@@ -44,17 +53,32 @@
         <a class="btn" href="{{ url_for('register_page') }}">+ Register Student</a>
     </div>
 
-    <div class="video-box">
+    <div id="spoofBanner"></div>
+
+    <div class="video-box" id="videoBox">
         <img src="{{ url_for('video_feed') }}" alt="Live attendance camera">
     </div>
-    <p class="hint">Look at the camera. A green box with your name appears when you are recognised,
-        and a popup confirms when attendance is marked.</p>
+    <p class="hint">Look at the camera and <b>blink once</b>. A green box with your name appears when you are
+        recognised, and a popup confirms when attendance is marked. Photos or videos shown on a
+        mobile, tablet or screen are rejected.</p>
 </div>
 
 <div id="toastBox"></div>
 
 <script>
     let lastEventId = null;
+    let bannerTimer = null;
+
+    function showSpoofBanner(e) {
+        const banner = document.getElementById('spoofBanner');
+        const box = document.getElementById('videoBox');
+        banner.textContent = '🚫 FAKE FACE DETECTED – ' + (e.message || 'Photo/video on a device') +
+                             ' (' + e.time + ')';
+        banner.style.display = 'block';
+        box.classList.remove('alert'); void box.offsetWidth; box.classList.add('alert');
+        clearTimeout(bannerTimer);
+        bannerTimer = setTimeout(() => { banner.style.display = 'none'; }, 6000);
+    }
 
     function showToast(e) {
         const titles = {
@@ -62,8 +86,10 @@
             already:  'ℹ️ Already Marked Today',
             noclass:  '⏳ No Class Running Now',
             unknown:  '⚠️ Student Not Found',
-            offline:  '❌ Database Error'
+            offline:  '❌ Database Error',
+            spoof:    '🚫 Fake Face – Device Detected'
         };
+        if (e.type === 'spoof') showSpoofBanner(e);
         const div = document.createElement('div');
         div.className = 'toast ' + e.type;
         div.innerHTML = '<b>' + (titles[e.type] || 'Notice') + '</b>' +
